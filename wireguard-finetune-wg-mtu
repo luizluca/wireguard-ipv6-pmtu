@@ -1,0 +1,137 @@
+#!/bin/sh
+#
+# SPDX-License-Identifier: GPL-3.0-or-later 
+# SPDXVersion: SPDX-2.2
+# SPDX-FileCopyrightText: Copyright 2023 <luizluca@gmail.com>
+#
+# Wireguard interface uses by default an MTU of 1420. That considers as the
+# worst case scenario two peers connecting using IPv6 over an MTU=1500 link
+#
+# 1500 -40(IPv6 header) -8(UDP header) -32(wg header) = 1420
+#
+# However, whenever the MTU between peers is smaller (like when PPPoE is in
+# use), the 1420 is not enough, fragmenting the encrypted packets. This would
+# lead either to a less performant connection (ip fragment overhead) to a
+# broken connection (if fragmented packets are dropped by ISP).
+#
+# When peers are connected using IPv4, the default 1420 is enough (considering
+# a standard 20-byte IPv4 header) as it really requires 1440.
+#
+# 1500 -20(IPv4 header) -8(UDP header) -32(wg header) = 1440
+#
+# The extra 20 bytes are enough to fit most tunneling protocol, like PPPoE+L2TP
+#
+# This script look for cached PMTU routes and updates all wireguard routes to that
+# peer to match the usable MTU. It will also adapt if the outgoing interface uses a
+# smaller MTU, even when there is no PMTU. 
+#
+# Once the route MTU is reduced, wireguard traffic will not trigger "packet too big"
+# answer. If nothing else sends a large packet, the PMTU route will expire and this
+# script will remove the MTU reduction from all allowed ip routes. Once a new large
+# packet is sent, a new "packet too big" would be generated and this script would
+# again re-add the MTU reduction. There is not a known way to refresh a cached PMTU
+# route to avoid this cycle.
+#
+# This script must run periodically or, ideally, triggered when a PMTU change occurs.
+# However, "ip monitor" does not emmit an event for cached routes.
+#
+# PMTU DOES NOT WORK with busybox ip as it does not show mtu field. Please, use iproute2.
+# (for OpenWrt, ip-tiny is enough). However, it would still work if the smaller MTU
+# in the path is a local interface as it also considers local interface MTU.
+#
+# It was only tested with busybox ash.
+#
+iproute2_read() {
+	local line="$1"
+	local field="$2"
+	local value=""
+	if [[ "$line" = *" $field "* ]]; then
+		value=${line#* $field }
+		value=${value%% *}
+	fi
+	[ "$value" ] || return
+	echo "$value"
+}
+
+ipv6_expand(){
+	awk -v OFS=":" -F: '{
+		j=NF
+		for(i=8;i>=1;i--) {
+			if (!$(i) && j<i) {
+				if($(j)) {
+					$(i)=$(j)
+					$(j)=""
+					j--
+				} else
+					$(i)=0
+			}
+			$(i)=gensub(" ","0","g",sprintf("%4s",$(i)))
+		}
+		print
+	}'
+}
+
+IPV6_HEADER_LEN=40
+UDP_HEADER_LEN=8
+WG_HEADER_LEN=32
+
+wg show all dump | while read -r line; do
+	wgint=$(echo "$line" | cut -f1)
+	endpoint=$(echo "$line" | cut -f4)
+	allowed_ips=$(echo "$line" | cut -f5)
+
+	case "$endpoint" in
+		# IPv6
+		"["*"]:"*)	endpoint_port=${endpoint##*:}
+				endpoint=${endpoint:1}
+				endpoint=${endpoint%%]:*}
+				endpoint=$(echo "$endpoint" | ipv6_expand)
+		;;
+		# IPv4
+		*:*)		continue;;
+		# Local
+		*)		wgport=$endpoint
+				continue;;
+	esac
+
+	wgint_mtu=$(iproute2_read "$(ip -Numeric -oneline link show dev "$wgint")" mtu)
+	[ "$wgint_mtu" ] || { echo "Failed to get int $wgint MTU" >&2; continue; }
+
+	# ip route get fails without a "from xxx" if all matching routes uses from
+	# try to find the source address from conntrack
+	local_addr=$(awk -vpeer_addr="$endpoint" -vpeer_port=$endpoint_port -vlocal_port=$wgport '
+		$1!="ipv6" || $3!="udp" {next}
+		$6=="src=" peer_addr && $8=="sport=" peer_port && $9=="dport=" local_port { print substr($7,5) }
+		$7=="dst=" peer_addr && $9=="dport=" peer_port && $8=="sport=" local_port { print substr($6,5) }
+	' /proc/net/nf_conntrack)
+
+
+	endpoint_route=$(ip -6 -Numeric -oneline route get "$endpoint" ${local_addr:+from $local_addr})  ||
+		continue
+	[ "$endpoint_route" ] || { echo "Endpoint $endpoint is unreachable" >&2; continue; }
+
+	endpoint_pmtu="$(iproute2_read "$endpoint_route" mtu)"
+	endpoint_dev="$(iproute2_read "$endpoint_route" dev)"
+	endpoint_dev_mtu="$(iproute2_read "$(ip -Numeric -oneline link show dev "$endpoint_dev")" mtu)"
+
+	(IFS=,; for allowed_ip in $allowed_ips; do
+		if [[ $allowed_ip = *:* ]]; then
+			allowed_ip_route=$(ip -6 -Numeric -oneline route show dev "$wgint" "$allowed_ip")
+		else
+			allowed_ip_route=$(ip -4 -Numeric -oneline route show dev "$wgint" "$allowed_ip")
+		fi || continue
+
+		allowed_ip_route_mtu="$(iproute2_read "$allowed_ip_route" mtu)"
+
+		# If there is no PMTU, it should match the standard 1420
+		mtu=$((${endpoint_pmtu:-endpoint_dev_mtu} - IPV6_HEADER_LEN - UDP_HEADER_LEN - WG_HEADER_LEN))
+
+		# if the required MTU is larget than wg interface MTU, we don't need it
+		if [ "$mtu" -ge "$wgint_mtu" ]; then
+			mtu=""
+		fi
+		[ "$mtu" != "$allowed_ip_route_mtu" ] || continue
+
+		eval ip route change ${allowed_ip_route/mtu $allowed_ip_route_mtu } dev $wgint ${mtu:+mtu $mtu}
+	done)
+done
