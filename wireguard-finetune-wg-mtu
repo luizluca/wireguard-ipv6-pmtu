@@ -33,7 +33,7 @@
 # route to avoid this cycle.
 #
 # This script must run periodically or, ideally, triggered when a PMTU change occurs.
-# However, "ip monitor" does not emmit an event for cached routes.
+# However, "ip monitor" does not emit an event for cached routes.
 #
 # PMTU DOES NOT WORK with busybox ip as it does not show mtu field. Please, use iproute2.
 # (for OpenWrt, ip-tiny is enough). However, it would still work if the smaller MTU
